@@ -1,6 +1,7 @@
 using System;
 using System.Runtime.InteropServices;
 using System.Text.Json;
+using System.Threading;
 using FliptClient.Models;
 
 namespace FliptClient
@@ -10,7 +11,16 @@ namespace FliptClient
     /// </summary>
     public class FliptClient : IDisposable
     {
+        private static readonly TimeSpan ExpiryBuffer = TimeSpan.FromSeconds(30);
+        private static readonly TimeSpan MinRetryDelay = TimeSpan.FromSeconds(5);
+
+        private readonly IAuthenticationProvider? _authenticationProvider;
+        private readonly int _maxAuthRetries;
         private IntPtr _engine;
+        private int _consecutiveAuthFailures;
+        private DateTimeOffset? _currentExpiry;
+        private Timer? _authRefreshTimer;
+        private int _disposed;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="FliptClient"/> class.
@@ -24,14 +34,37 @@ namespace FliptClient
                 throw new ValidationException("ClientOptions cannot be null");
             }
 
+#pragma warning disable CS0618 // Suppress obsolete warning for internal usage
+            if (options.Authentication != null && options.AuthenticationProvider != null)
+            {
+                throw new ValidationException("Cannot set both Authentication and AuthenticationProvider");
+            }
+
+            _authenticationProvider = options.AuthenticationProvider;
+
+            if (_authenticationProvider != null)
+            {
+                AuthenticationLease initial = _authenticationProvider.Get();
+                options.Authentication = initial.Strategy;
+                _currentExpiry = initial.ExpiresAt;
+                _maxAuthRetries = initial.MaxRetries ?? 0;
+            }
+#pragma warning restore CS0618
+
             string optsJson = JsonSerializer.Serialize(options);
             _engine = NativeMethods.InitializeEngine(optsJson);
+
+            // Start auth refresh timer only for expiring leases
+            if (_authenticationProvider != null && _currentExpiry != null)
+            {
+                ScheduleNextAuthRefresh();
+            }
         }
 
         /// <summary>
         /// Evaluates a variant flag for the given entity and context.
         /// </summary>
-        /// <returns></returns>
+        /// <returns>The variant evaluation response.</returns>
         public VariantEvaluationResponse? EvaluateVariant(string flagKey, string entityId, Dictionary<string, string> context)
         {
             if (string.IsNullOrWhiteSpace(flagKey))
@@ -71,7 +104,7 @@ namespace FliptClient
         /// <summary>
         /// Evaluates a boolean flag for the given entity and context.
         /// </summary>
-        /// <returns></returns>
+        /// <returns>The boolean evaluation response.</returns>
         public BooleanEvaluationResponse? EvaluateBoolean(string flagKey, string entityId, Dictionary<string, string> context)
         {
             if (string.IsNullOrWhiteSpace(flagKey))
@@ -111,7 +144,7 @@ namespace FliptClient
         /// <summary>
         /// Evaluates a batch of flag requests.
         /// </summary>
-        /// <returns></returns>
+        /// <returns>The batch evaluation response.</returns>
         public BatchEvaluationResponse? EvaluateBatch(List<EvaluationRequest> requests)
         {
             if (requests == null || requests.Count == 0)
@@ -135,7 +168,7 @@ namespace FliptClient
         /// <summary>
         /// Lists all flags in the current namespace.
         /// </summary>
-        /// <returns></returns>
+        /// <returns>Array of flags.</returns>
         public Flag[]? ListFlags()
         {
             IntPtr resultPtr = NativeMethods.ListFlags(_engine);
@@ -153,7 +186,7 @@ namespace FliptClient
         /// <summary>
         /// Gets the snapshot for the client.
         /// </summary>
-        /// <returns></returns>
+        /// <returns>The snapshot string.</returns>
         public string? GetSnapshot()
         {
             IntPtr resultPtr = NativeMethods.GetSnapshot(_engine);
@@ -167,11 +200,95 @@ namespace FliptClient
         /// </summary>
         public void Dispose()
         {
+            if (Interlocked.CompareExchange(ref _disposed, 1, 0) != 0)
+            {
+                return;
+            }
+
+            _authRefreshTimer?.Dispose();
+            _authRefreshTimer = null;
+
             if (_engine != IntPtr.Zero)
             {
                 NativeMethods.DestroyEngine(_engine);
                 _engine = IntPtr.Zero;
             }
+        }
+
+        private void ScheduleNextAuthRefresh()
+        {
+            if (Volatile.Read(ref _disposed) != 0 || _currentExpiry == null)
+            {
+                return;
+            }
+
+            TimeSpan delay = _currentExpiry.Value - ExpiryBuffer - DateTimeOffset.UtcNow;
+            if (delay <= TimeSpan.Zero)
+            {
+                delay = MinRetryDelay;
+            }
+
+            _authRefreshTimer?.Dispose();
+            _authRefreshTimer = new Timer(OnAuthRefresh, null, delay, Timeout.InfiniteTimeSpan);
+        }
+
+        private void OnAuthRefresh(object? state)
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                return;
+            }
+
+            try
+            {
+                AuthenticationLease lease = _authenticationProvider!.Get();
+
+                if (Volatile.Read(ref _disposed) != 0)
+                {
+                    return;
+                }
+
+                string authJson = JsonSerializer.Serialize(lease.Strategy);
+                IntPtr resultPtr = NativeMethods.UpdateAuthentication(_engine, authJson);
+                string resultJson = Marshal.PtrToStringAnsi(resultPtr) ?? throw new FliptException("Failed to get result from native code");
+                NativeMethods.DestroyString(resultPtr);
+
+                var result = JsonSerializer.Deserialize<UpdateAuthResult>(resultJson);
+                if (result != null && result.Status == "success")
+                {
+                    Interlocked.Exchange(ref _consecutiveAuthFailures, 0);
+                    _currentExpiry = lease.ExpiresAt;
+                }
+                else
+                {
+                    Interlocked.Increment(ref _consecutiveAuthFailures);
+                    string errorMsg = result?.ErrorMessage ?? "Unknown error";
+                    System.Diagnostics.Trace.TraceWarning($"Failed to update engine authentication: {errorMsg}");
+                }
+            }
+            catch (Exception e)
+            {
+                Interlocked.Increment(ref _consecutiveAuthFailures);
+                System.Diagnostics.Trace.TraceWarning($"Failed to refresh authentication: {e.Message}");
+            }
+
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                return;
+            }
+
+            if (_currentExpiry == null)
+            {
+                return;
+            }
+
+            if (Volatile.Read(ref _consecutiveAuthFailures) >= _maxAuthRetries)
+            {
+                System.Diagnostics.Trace.TraceError($"Authentication refresh failed after {_maxAuthRetries} consecutive attempts, stopping refresh");
+                return;
+            }
+
+            ScheduleNextAuthRefresh();
         }
     }
 

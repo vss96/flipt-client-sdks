@@ -245,3 +245,21 @@ public class BatchResult : Result<BatchEvaluationResponse>
 public class ListFlagsResult : Result<Flag[]>
 {
 }
+
+/// <summary>
+/// Result for an update authentication call.
+/// </summary>
+public class UpdateAuthResult
+{
+    /// <summary>
+    /// Gets or sets the status of the result (e.g., 'success' or 'failure').
+    /// </summary>
+    [JsonPropertyName("status")]
+    public required string Status { get; set; }
+
+    /// <summary>
+    /// Gets or sets the error message, if any.
+    /// </summary>
+    [JsonPropertyName("error_message")]
+    public string? ErrorMessage { get; set; }
+}

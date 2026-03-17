@@ -42,9 +42,16 @@ namespace FliptClient.Models
         /// <summary>
         /// Gets or sets authentication options.
         /// </summary>
+        [Obsolete("Use AuthenticationProvider with AuthenticationLease.Fixed() instead")]
         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
         [JsonPropertyName("authentication")]
         public Authentication? Authentication { get; set; }
+
+        /// <summary>
+        /// Gets or sets the authentication provider for dynamic token refresh.
+        /// </summary>
+        [JsonIgnore]
+        public IAuthenticationProvider? AuthenticationProvider { get; set; }
 
         /// <summary>
         /// Gets or sets reference string for advanced use cases.

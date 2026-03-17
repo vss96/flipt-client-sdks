@@ -33,6 +33,9 @@ namespace FliptClient
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         public delegate IntPtr GetSnapshotDelegate(IntPtr engine);
 
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        public delegate IntPtr UpdateAuthenticationDelegate(IntPtr engine, string authJson);
+
         public static InitializeEngineDelegate InitializeEngine;
         public static EvaluateVariantDelegate EvaluateVariant;
         public static EvaluateBooleanDelegate EvaluateBoolean;
@@ -41,6 +44,7 @@ namespace FliptClient
         public static DestroyEngineDelegate DestroyEngine;
         public static DestroyStringDelegate DestroyString;
         public static GetSnapshotDelegate GetSnapshot;
+        public static UpdateAuthenticationDelegate UpdateAuthentication;
 
         static NativeMethods()
         {
@@ -67,6 +71,7 @@ namespace FliptClient
             DestroyEngine = GetDelegate<DestroyEngineDelegate>("destroy_engine");
             DestroyString = GetDelegate<DestroyStringDelegate>("destroy_string");
             GetSnapshot = GetDelegate<GetSnapshotDelegate>("get_snapshot");
+            UpdateAuthentication = GetDelegate<UpdateAuthenticationDelegate>("update_authentication");
         }
 
         private static string GetLibraryName()
