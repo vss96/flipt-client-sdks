@@ -1,6 +1,6 @@
 import pydantic
 from packaging import version
-from datetime import timedelta
+from datetime import datetime, timedelta
 import os
 
 PYDANTIC_V2 = version.parse(pydantic.VERSION) >= version.parse("2.0.0")
@@ -39,6 +39,179 @@ class JWTAuthentication(AuthenticationStrategy):
     """JWT authentication."""
 
     jwt_token: str
+
+
+class AuthenticationLease:
+    """An authentication credential with an optional expiry time.
+
+    Returned by an AuthenticationProvider to provide both the credential and
+    when it expires.  Use the fluent builder to create instances::
+
+        # Expiring lease (triggers refresh before expiry)
+        AuthenticationLease.expiring(expires_at).jwt(token).build()
+        AuthenticationLease.expiring(expires_at).jwt(token).max_retries(3).build()
+
+        # Fixed lease (no expiry, no refresh scheduling)
+        AuthenticationLease.fixed().client_token(token).build()
+    """
+
+    _DEFAULT_MAX_RETRIES = 5
+
+    def __init__(
+        self,
+        strategy: "AuthenticationStrategy",
+        expires_at: Optional[datetime] = None,
+        max_retries_value: int = 0,
+    ):
+        if strategy is None:
+            raise ValueError("strategy cannot be None")
+        self._strategy = strategy
+        self._expires_at = expires_at
+        self._max_retries_value = max_retries_value
+
+    @staticmethod
+    def fixed() -> "FixedBuilder":
+        """Start building a fixed lease with no expiry."""
+        return FixedBuilder()
+
+    @staticmethod
+    def expiring(expires_at: datetime) -> "ExpiringBuilder":
+        """Start building an expiring lease that triggers a refresh before the given expiry.
+
+        Args:
+            expires_at: When this credential expires.
+        """
+        if expires_at is None:
+            raise ValueError("expires_at cannot be None; use fixed() for no expiry")
+        return ExpiringBuilder(expires_at)
+
+    @property
+    def strategy(self) -> "AuthenticationStrategy":
+        """The authentication strategy for this lease."""
+        return self._strategy
+
+    def get_expires_at(self) -> Optional[datetime]:
+        """Returns the expiry time, or None for fixed leases."""
+        return self._expires_at
+
+    def get_max_retries(self) -> Optional[int]:
+        """Returns the max consecutive refresh retries, or None for fixed leases."""
+        if self._expires_at is None:
+            return None
+        return self._max_retries_value
+
+
+class FixedBuilder:
+    """Builder for fixed leases (no expiry, no retries)."""
+
+    def jwt(self, token: str) -> "FixedBuildStep":
+        """Set JWT authentication for this lease."""
+        return FixedBuildStep(JWTAuthentication(jwt_token=token))
+
+    def client_token(self, token: str) -> "FixedBuildStep":
+        """Set client token authentication for this lease."""
+        return FixedBuildStep(ClientTokenAuthentication(client_token=token))
+
+
+class FixedBuildStep:
+    """Final build step for fixed leases."""
+
+    def __init__(self, strategy: "AuthenticationStrategy"):
+        self._strategy = strategy
+
+    def build(self) -> AuthenticationLease:
+        """Build the fixed authentication lease."""
+        return AuthenticationLease(strategy=self._strategy)
+
+
+class ExpiringBuilder:
+    """Builder for expiring leases."""
+
+    def __init__(self, expires_at: datetime):
+        self._expires_at = expires_at
+
+    def jwt(self, token: str) -> "ExpiringBuildStep":
+        """Set JWT authentication for this lease."""
+        return ExpiringBuildStep(
+            JWTAuthentication(jwt_token=token), self._expires_at
+        )
+
+    def client_token(self, token: str) -> "ExpiringBuildStep":
+        """Set client token authentication for this lease."""
+        return ExpiringBuildStep(
+            ClientTokenAuthentication(client_token=token), self._expires_at
+        )
+
+
+class ExpiringBuildStep:
+    """Final build step for expiring leases with configurable retries."""
+
+    def __init__(self, strategy: "AuthenticationStrategy", expires_at: datetime):
+        self._strategy = strategy
+        self._expires_at = expires_at
+        self._max_retries = AuthenticationLease._DEFAULT_MAX_RETRIES
+
+    def max_retries(self, n: int) -> "ExpiringBuildStep":
+        """Set the maximum number of consecutive refresh failures before stopping.
+
+        Defaults to 5.
+
+        Args:
+            n: Maximum number of retries (must be >= 0).
+        """
+        if n < 0:
+            raise ValueError("max_retries must be non-negative")
+        self._max_retries = n
+        return self
+
+    def build(self) -> AuthenticationLease:
+        """Build the expiring authentication lease."""
+        return AuthenticationLease(
+            strategy=self._strategy,
+            expires_at=self._expires_at,
+            max_retries_value=self._max_retries,
+        )
+
+
+# AuthenticationProvider is simply a callable: () -> AuthenticationLease
+# We define a Protocol for type checking (Python 3.8+ compatible via typing_extensions fallback)
+try:
+    from typing import Protocol, runtime_checkable
+except ImportError:
+    from typing_extensions import Protocol, runtime_checkable
+
+
+@runtime_checkable
+class AuthenticationProvider(Protocol):
+    """A provider for authentication credentials that supports token refresh.
+
+    Implement this protocol (or pass any callable with the right signature) to
+    provide dynamic authentication tokens that can be refreshed when they expire.
+    The SDK calls the provider when the current token is about to expire.
+
+    Example::
+
+        def my_provider() -> AuthenticationLease:
+            token = my_oauth_client.get_access_token()
+            return (AuthenticationLease
+                .expiring(token.expires_at)
+                .jwt(token.value)
+                .build())
+
+        client = FliptClient(
+            opts=ClientOptions(url="https://flipt.example.com"),
+            authentication_provider=my_provider,
+        )
+    """
+
+    def __call__(self) -> AuthenticationLease: ...
+
+
+class AuthUpdateResult(BaseModel):
+    """Result from the update_authentication FFI call."""
+
+    status: str
+    error_message: Optional[str] = None
 
 
 class FetchMode(Enum):

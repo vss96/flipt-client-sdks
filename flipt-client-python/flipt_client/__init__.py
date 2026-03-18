@@ -1,12 +1,18 @@
 from pydantic import BaseModel
 import ctypes
+import logging
 import os
 import platform
+import threading
 import warnings
-from typing import Optional
+from datetime import datetime, timedelta
+from typing import Callable, List, Optional
+
 from .errors import FliptError, ValidationError, EvaluationError
 
 from .models import (
+    AuthenticationLease,
+    AuthUpdateResult,
     BatchEvaluationResponse,
     BatchResult,
     BooleanEvaluationResponse,
@@ -21,7 +27,7 @@ from .models import (
     model_from_json,
 )
 
-from typing import List
+logger = logging.getLogger(__name__)
 
 
 class InternalEvaluationRequest(BaseModel):
@@ -34,7 +40,35 @@ class InternalEvaluationRequest(BaseModel):
 class FliptClient:
     """Main client for interacting with Flipt feature flag engine."""
 
-    def __init__(self, opts: ClientOptions = ClientOptions()):
+    _EXPIRY_BUFFER = timedelta(seconds=30)
+    _MIN_RETRY_DELAY = timedelta(seconds=5)
+
+    def __init__(
+        self,
+        opts: ClientOptions = ClientOptions(),
+        authentication_provider: Optional[Callable[[], AuthenticationLease]] = None,
+    ):
+        if authentication_provider is not None and opts.authentication is not None:
+            raise ValidationError(
+                "Cannot set both authentication (in opts) and authentication_provider"
+            )
+
+        self._authentication_provider = authentication_provider
+        self._auth_timer = None  # type: Optional[threading.Timer]
+        self._closed = threading.Event()
+        self._consecutive_auth_failures = 0
+        self._max_auth_retries = 0
+        self._current_expiry = None  # type: Optional[datetime]
+
+        # If a provider is given, call it to get the initial lease
+        if self._authentication_provider is not None:
+            initial_lease = self._authentication_provider()
+            opts = opts.copy() if hasattr(opts, "copy") else opts.model_copy()
+            opts.authentication = initial_lease.strategy
+            self._current_expiry = initial_lease.get_expires_at()
+            max_retries = initial_lease.get_max_retries()
+            self._max_auth_retries = max_retries if max_retries is not None else 0
+
         namespace = opts.namespace or "default"
         # Mapping of platform-architecture combinations to their respective library file paths
         lib_files = {
@@ -91,14 +125,86 @@ class FliptClient:
         self.ffi_core.get_snapshot.argtypes = [ctypes.c_void_p]
         self.ffi_core.get_snapshot.restype = ctypes.POINTER(ctypes.c_char_p)
 
+        self.ffi_core.update_authentication.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+        ]
+        self.ffi_core.update_authentication.restype = ctypes.POINTER(ctypes.c_char_p)
+
         client_opts_serialized = model_to_json(opts, exclude_none=True).encode("utf-8")
 
         self.engine = self.ffi_core.initialize_engine(client_opts_serialized)
 
+        # Start auth refresh scheduler for expiring leases
+        if self._authentication_provider is not None and self._current_expiry is not None:
+            self._schedule_next_auth_refresh()
+
     def close(self):
+        self._closed.set()
+        if hasattr(self, "_auth_timer") and self._auth_timer is not None:
+            self._auth_timer.cancel()
+            self._auth_timer = None
         if hasattr(self, "engine") and self.engine is not None:
             self.ffi_core.destroy_engine(self.engine)
             self.engine = None
+
+    def _schedule_next_auth_refresh(self):
+        """Schedule the next authentication refresh based on the current expiry."""
+        if self._closed.is_set() or self._current_expiry is None:
+            return
+
+        now = datetime.now(self._current_expiry.tzinfo)
+        delay = (self._current_expiry - self._EXPIRY_BUFFER - now).total_seconds()
+        delay = max(delay, self._MIN_RETRY_DELAY.total_seconds())
+
+        self._auth_timer = threading.Timer(delay, self._refresh_authentication)
+        self._auth_timer.daemon = True
+        self._auth_timer.start()
+
+    def _refresh_authentication(self):
+        """Refresh authentication by calling the provider and updating the engine."""
+        if self._closed.is_set():
+            return
+
+        try:
+            lease = self._authentication_provider()
+            if self._closed.is_set():
+                return
+
+            auth_json = model_to_json(
+                lease.strategy, exclude_none=True
+            ).encode("utf-8")
+            response = self.ffi_core.update_authentication(self.engine, auth_json)
+            bytes_returned = ctypes.cast(response, ctypes.c_char_p).value
+            result = model_from_json(AuthUpdateResult, bytes_returned)
+            self.ffi_core.destroy_string(response)
+
+            if result.status != "success":
+                self._consecutive_auth_failures += 1
+                logger.warning(
+                    "Failed to update engine authentication: %s",
+                    result.error_message or "Unknown error",
+                )
+            else:
+                self._consecutive_auth_failures = 0
+                self._current_expiry = lease.get_expires_at()
+        except Exception as e:
+            self._consecutive_auth_failures += 1
+            logger.warning("Failed to refresh authentication: %s", e)
+
+        if self._closed.is_set():
+            return
+        if self._current_expiry is None:
+            return
+        if self._consecutive_auth_failures >= self._max_auth_retries:
+            logger.error(
+                "Authentication refresh failed after %d consecutive attempts, "
+                "stopping refresh",
+                self._max_auth_retries,
+            )
+            return
+
+        self._schedule_next_auth_refresh()
 
     def evaluate_variant(
         self, flag_key: str, entity_id: str, context: Optional[dict] = None

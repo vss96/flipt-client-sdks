@@ -93,7 +93,7 @@ client.close()
 
 ### Constructor Arguments
 
-The `FliptClient` constructor accepts a single `opts` argument:
+The `FliptClient` constructor accepts the following arguments:
 
 - `opts`: An instance of the `ClientOptions` class. The structure is:
   - `environment`: The environment (Flipt v2) to fetch flag state from. If not provided, the client will default to the `default` environment.
@@ -107,6 +107,7 @@ The `FliptClient` constructor accepts a single `opts` argument:
   - `error_strategy`: Error strategy (`fail` or `fallback`). Defaults to fail.
   - `snapshot`: A base64 encoded snapshot of the engine state. Defaults to `None`. See [Snapshotting](#snapshotting).
   - `tls_config`: TLS configuration for connecting to Flipt servers with custom certificates. See [TLS Configuration](#tls-configuration).
+- `authentication_provider`: An optional callable that returns an `AuthenticationLease`. See [Dynamic Authentication](#dynamic-authentication). Mutually exclusive with `opts.authentication`.
 
 ### Authentication
 
@@ -115,6 +116,65 @@ The `FliptClient` supports:
 - No Authentication (default)
 - [Client Token Authentication](https://docs.flipt.io/authentication/using-tokens)
 - [JWT Authentication](https://docs.flipt.io/authentication/using-jwts)
+- [Dynamic Authentication](#dynamic-authentication) (token refresh)
+
+### Dynamic Authentication
+
+For tokens that expire (e.g., OAuth2, short-lived JWTs), pass an `authentication_provider` to the client constructor. The provider is a callable that returns an `AuthenticationLease` describing the credential and when it expires. The SDK will automatically refresh the token before it expires.
+
+**Expiring JWT (auto-refresh):**
+
+```python
+from datetime import datetime, timezone
+from flipt_client import FliptClient
+from flipt_client.models import AuthenticationLease, ClientOptions
+
+def my_auth_provider():
+    # Fetch a fresh token from your identity provider
+    token = my_oauth_client.get_access_token()
+    return (
+        AuthenticationLease
+        .expiring(token.expires_at)
+        .jwt(token.value)
+        .max_retries(3)
+        .build()
+    )
+
+client = FliptClient(
+    opts=ClientOptions(url="https://flipt.example.com"),
+    authentication_provider=my_auth_provider,
+)
+
+# Use the client normally - tokens refresh automatically
+result = client.evaluate_variant(flag_key="flag1", entity_id="user1")
+
+# Always close to stop the refresh scheduler and release resources
+client.close()
+```
+
+**Fixed client token (no refresh):**
+
+```python
+from flipt_client import FliptClient
+from flipt_client.models import AuthenticationLease, ClientOptions
+
+client = FliptClient(
+    opts=ClientOptions(url="https://flipt.example.com"),
+    authentication_provider=lambda: (
+        AuthenticationLease.fixed().client_token("my-static-token").build()
+    ),
+)
+```
+
+The `AuthenticationLease` builder supports two modes:
+
+- `AuthenticationLease.fixed()`: For credentials that do not expire. No refresh will be scheduled.
+- `AuthenticationLease.expiring(expires_at)`: For credentials that expire at the given `datetime`. The SDK refreshes the token 30 seconds before expiry (minimum 5-second delay).
+  - `.max_retries(n)`: Maximum consecutive refresh failures before stopping (default: 5).
+
+Both modes support `.jwt(token)` and `.client_token(token)` to set the authentication type.
+
+> **Note:** `authentication_provider` and `opts.authentication` are mutually exclusive. Setting both raises a `ValidationError`.
 
 ### TLS Configuration
 
