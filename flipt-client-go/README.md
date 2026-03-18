@@ -136,6 +136,51 @@ The `Client` supports the following authentication strategies:
 - [Client Token Authentication](https://docs.flipt.io/authentication/using-tokens)
 - [JWT Authentication](https://docs.flipt.io/authentication/using-jwts)
 
+#### Static Authentication
+
+For tokens that do not expire, use the static authentication options:
+
+```go
+client, err := flipt.NewClient(ctx,
+  flipt.WithClientTokenAuthentication("your-token"),
+)
+```
+
+#### Dynamic Authentication (Token Refresh)
+
+For tokens that expire, use `WithAuthenticationProvider` to supply a function that returns an `AuthenticationLease`. The client will automatically refresh credentials before they expire.
+
+```go
+client, err := flipt.NewClient(ctx,
+  flipt.WithURL("http://localhost:8080"),
+  flipt.WithAuthenticationProvider(func() (*flipt.AuthenticationLease, error) {
+    // Fetch a new token from your auth service
+    token, expiresAt, err := fetchTokenFromAuthService()
+    if err != nil {
+      return nil, err
+    }
+    return flipt.NewExpiringClientTokenLease(token, expiresAt), nil
+  }),
+)
+```
+
+**Lease constructors:**
+
+| Constructor | Description |
+|---|---|
+| `NewFixedClientTokenLease(token)` | Client token that never expires (no refresh) |
+| `NewFixedJWTLease(token)` | JWT that never expires (no refresh) |
+| `NewExpiringClientTokenLease(token, expiresAt, opts...)` | Client token with expiry and automatic refresh |
+| `NewExpiringJWTLease(token, expiresAt, opts...)` | JWT with expiry and automatic refresh |
+
+**Lease options:**
+
+- `WithMaxRetries(n)`: Maximum consecutive refresh failures before stopping (default: 5)
+
+The refresh goroutine fires 30 seconds before the token expires. If the provider returns an error, the client retries with a minimum 5-second delay between attempts.
+
+> **Note:** `WithAuthenticationProvider` is mutually exclusive with `WithClientTokenAuthentication` and `WithJWTAuthentication`. Using both will return an error.
+
 ### TLS Configuration
 
 The `Client` supports configuring TLS settings for secure connections to Flipt servers using the standard library `tls.Config`. This provides maximum flexibility for:

@@ -1,6 +1,9 @@
 package flipt
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // EvaluationRequest represents the request structure for evaluating a flag.
 type EvaluationRequest struct {
@@ -128,4 +131,91 @@ type AfterHookData struct {
 	Value       string
 	Reason      string
 	SegmentKeys []string
+}
+
+// AuthenticationProvider is a function that returns an AuthenticationLease.
+// It is called to obtain (and later refresh) authentication credentials.
+type AuthenticationProvider func() (*AuthenticationLease, error)
+
+const (
+	// defaultMaxAuthRetries is the default maximum number of consecutive
+	// authentication refresh failures before the refresh goroutine stops.
+	defaultMaxAuthRetries = 5
+)
+
+// AuthenticationLease holds an authentication strategy and optional expiry metadata
+// for dynamic authentication. Use the NewFixed* or NewExpiring* constructors to create leases.
+type AuthenticationLease struct {
+	strategy   any        // clientTokenAuthentication or jwtAuthentication
+	expiresAt  *time.Time // nil for fixed leases
+	maxRetries int
+}
+
+// LeaseOption configures optional parameters on an expiring AuthenticationLease.
+type LeaseOption func(*AuthenticationLease)
+
+// WithMaxRetries sets the maximum number of consecutive authentication refresh
+// failures before the refresh goroutine stops. The default is 5. Panics if n < 0.
+func WithMaxRetries(n int) LeaseOption {
+	if n < 0 {
+		panic("flipt: WithMaxRetries: n must be >= 0")
+	}
+	return func(l *AuthenticationLease) {
+		l.maxRetries = n
+	}
+}
+
+// NewFixedJWTLease creates a fixed (non-expiring) JWT authentication lease.
+func NewFixedJWTLease(token string) *AuthenticationLease {
+	return &AuthenticationLease{
+		strategy: jwtAuthentication{Token: token},
+	}
+}
+
+// NewFixedClientTokenLease creates a fixed (non-expiring) client token authentication lease.
+func NewFixedClientTokenLease(token string) *AuthenticationLease {
+	return &AuthenticationLease{
+		strategy: clientTokenAuthentication{Token: token},
+	}
+}
+
+// NewExpiringJWTLease creates a JWT authentication lease that expires at the given time.
+// The client will call the AuthenticationProvider to refresh credentials before expiry.
+func NewExpiringJWTLease(token string, expiresAt time.Time, opts ...LeaseOption) *AuthenticationLease {
+	t := expiresAt
+	l := &AuthenticationLease{
+		strategy:   jwtAuthentication{Token: token},
+		expiresAt:  &t,
+		maxRetries: defaultMaxAuthRetries,
+	}
+	for _, opt := range opts {
+		opt(l)
+	}
+	return l
+}
+
+// NewExpiringClientTokenLease creates a client token authentication lease that expires at the given time.
+// The client will call the AuthenticationProvider to refresh credentials before expiry.
+func NewExpiringClientTokenLease(token string, expiresAt time.Time, opts ...LeaseOption) *AuthenticationLease {
+	t := expiresAt
+	l := &AuthenticationLease{
+		strategy:   clientTokenAuthentication{Token: token},
+		expiresAt:  &t,
+		maxRetries: defaultMaxAuthRetries,
+	}
+	for _, opt := range opts {
+		opt(l)
+	}
+	return l
+}
+
+// ExpiresAt returns the expiry time of the lease, or nil if the lease is fixed.
+func (l *AuthenticationLease) ExpiresAt() *time.Time {
+	return l.expiresAt
+}
+
+// MaxRetries returns the maximum number of consecutive refresh failures allowed.
+// Returns 0 for fixed leases.
+func (l *AuthenticationLease) MaxRetries() int {
+	return l.maxRetries
 }

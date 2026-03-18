@@ -63,6 +63,7 @@ func WithUpdateInterval(updateInterval time.Duration) Option {
 	}
 }
 
+// Deprecated: Use WithAuthenticationProvider with NewFixedClientTokenLease instead.
 // WithClientTokenAuthentication sets client token authentication.
 func WithClientTokenAuthentication(token string) Option {
 	return func(cfg *config) {
@@ -70,10 +71,20 @@ func WithClientTokenAuthentication(token string) Option {
 	}
 }
 
+// Deprecated: Use WithAuthenticationProvider with NewFixedJWTLease instead.
 // WithJWTAuthentication sets JWT authentication.
 func WithJWTAuthentication(token string) Option {
 	return func(cfg *config) {
 		cfg.Authentication = jwtAuthentication{Token: token}
+	}
+}
+
+// WithAuthenticationProvider sets a dynamic authentication provider that supplies
+// authentication credentials and can refresh them before expiry.
+// This is mutually exclusive with WithClientTokenAuthentication and WithJWTAuthentication.
+func WithAuthenticationProvider(provider AuthenticationProvider) Option {
+	return func(cfg *config) {
+		cfg.authenticationProvider = provider
 	}
 }
 
@@ -193,6 +204,9 @@ type config struct {
 	Hook Hook
 	// ForceAttemptHTTP2 optionally overrides the transport's HTTP/2 negotiation behavior.
 	ForceAttemptHTTP2 *bool
+	// authenticationProvider is a dynamic authentication provider. Optional.
+	// Mutually exclusive with Authentication.
+	authenticationProvider AuthenticationProvider
 }
 
 // validate validates the configuration and sets defaults.
@@ -203,6 +217,10 @@ func (c *config) validate() error {
 
 	if err := c.applyForceAttemptHTTP2(); err != nil {
 		return err
+	}
+
+	if c.Authentication != nil && c.authenticationProvider != nil {
+		return fmt.Errorf("authentication and authentication provider are mutually exclusive")
 	}
 
 	if c.Namespace == "" {

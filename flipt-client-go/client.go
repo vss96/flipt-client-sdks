@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "embed"
@@ -33,6 +34,11 @@ const (
 	defaultEnvironment = "default"
 	defaultNamespace   = "default"
 	statusSuccess      = "success"
+
+	// expiryBuffer is how far before token expiry the refresh goroutine fires.
+	expiryBuffer = 30 * time.Second
+	// minRetryDelay is the minimum delay between auth refresh attempts.
+	minRetryDelay = 5 * time.Second
 
 	fInitializeEngine = "initialize_engine"
 	fAllocate         = "allocate"
@@ -70,6 +76,13 @@ type Client struct {
 	closeOnce sync.Once
 
 	exportedFuncs map[string]api.Function
+
+	// auth refresh fields — lock-free via atomics + generation counter
+	authProvider            AuthenticationProvider
+	currentExpiry           atomic.Pointer[time.Time]
+	maxAuthRetries          atomic.Int32
+	consecutiveAuthFailures atomic.Int32
+	authGeneration          atomic.Int64 // incremented on each schedule; stale callbacks self-invalidate
 }
 
 // NewClient constructs a Client and performs an initial fetch of flag state.
@@ -126,6 +139,20 @@ func NewClient(ctx context.Context, opts ...Option) (_ *Client, err error) {
 		cancel:       cancel,
 		errChan:      make(chan error, 1),
 		snapshotChan: make(chan snapshot, 1),
+	}
+
+	// Initialize authentication from provider if configured
+	if cfg.authenticationProvider != nil {
+		lease, err := cfg.authenticationProvider()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get initial authentication: %w", err)
+		}
+		c.cfg.Authentication = lease.strategy
+		c.authProvider = cfg.authenticationProvider
+		if lease.expiresAt != nil {
+			c.currentExpiry.Store(lease.expiresAt)
+		}
+		c.maxAuthRetries.Store(int32(lease.maxRetries))
 	}
 
 	var (
@@ -244,6 +271,11 @@ func NewClient(ctx context.Context, opts ...Option) (_ *Client, err error) {
 			c.startPolling(fctx)
 		}
 	}()
+
+	// Start auth refresh goroutine if we have an expiring lease
+	if c.authProvider != nil && c.currentExpiry.Load() != nil {
+		c.scheduleAuthRefresh(ctx)
+	}
 
 	return c, nil
 }
@@ -447,6 +479,9 @@ func (c *Client) ListFlags(ctx context.Context) ([]Flag, error) {
 // Close cleans up the allocated resources.
 func (c *Client) Close(ctx context.Context) (err error) {
 	c.closeOnce.Do(func() {
+		// invalidate any pending auth refresh callbacks
+		c.authGeneration.Add(1)
+
 		// signal background goroutines to stop
 		c.cancel()
 
@@ -467,6 +502,73 @@ func (c *Client) Close(ctx context.Context) (err error) {
 	})
 
 	return err
+}
+
+// scheduleAuthRefresh schedules the next auth token refresh based on the current expiry.
+// Uses a generation counter instead of mutexes: each schedule increments the generation,
+// and the callback checks whether its generation is still current before executing.
+func (c *Client) scheduleAuthRefresh(ctx context.Context) {
+	expiry := c.currentExpiry.Load()
+	if expiry == nil {
+		return
+	}
+
+	delay := time.Until(*expiry) - expiryBuffer
+	if delay < minRetryDelay {
+		delay = minRetryDelay
+	}
+
+	gen := c.authGeneration.Add(1)
+	time.AfterFunc(delay, func() {
+		if c.authGeneration.Load() != gen {
+			return
+		}
+		c.refreshAuth(ctx)
+	})
+}
+
+// refreshAuth calls the authentication provider to refresh credentials.
+func (c *Client) refreshAuth(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
+
+	lease, err := c.authProvider()
+	if err != nil {
+		failures := c.consecutiveAuthFailures.Add(1)
+		if int(failures) >= int(c.maxAuthRetries.Load()) {
+			c.mu.Lock()
+			c.err = fmt.Errorf("authentication refresh failed after %d consecutive attempts: %w", failures, err)
+			c.mu.Unlock()
+			return
+		}
+
+		// Reschedule with minRetryDelay
+		gen := c.authGeneration.Add(1)
+		time.AfterFunc(minRetryDelay, func() {
+			if c.authGeneration.Load() != gen {
+				return
+			}
+			c.refreshAuth(ctx)
+		})
+		return
+	}
+
+	// Success: update authentication
+	c.mu.Lock()
+	c.cfg.Authentication = lease.strategy
+	c.mu.Unlock()
+
+	c.consecutiveAuthFailures.Store(0)
+	if lease.expiresAt != nil {
+		c.currentExpiry.Store(lease.expiresAt)
+	}
+	c.maxAuthRetries.Store(int32(lease.maxRetries))
+
+	// If the new lease is expiring, schedule the next refresh
+	if lease.expiresAt != nil {
+		c.scheduleAuthRefresh(ctx)
+	}
 }
 
 // unexported
@@ -641,12 +743,17 @@ func (c *Client) newRequest(ctx context.Context, url string) (*http.Request, err
 		}
 	}
 
-	if c.cfg.Authentication != nil {
-		switch auth := c.cfg.Authentication.(type) {
+	// Read authentication under lock since it may be updated by the auth refresh goroutine.
+	c.mu.RLock()
+	auth := c.cfg.Authentication
+	c.mu.RUnlock()
+
+	if auth != nil {
+		switch a := auth.(type) {
 		case clientTokenAuthentication:
-			req.Header.Set("Authorization", "Bearer "+auth.Token)
+			req.Header.Set("Authorization", "Bearer "+a.Token)
 		case jwtAuthentication:
-			req.Header.Set("Authorization", "JWT "+auth.Token)
+			req.Header.Set("Authorization", "JWT "+a.Token)
 		}
 	}
 	return req, nil
